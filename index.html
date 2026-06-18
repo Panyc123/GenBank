@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GenBank</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <style>
+        /* --- Termux 纯净控制台环境体系 --- */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: "Courier New", Courier, Consolas, Monaco, monospace !important;
+        }
+
+        body {
+            background-color: #000000;
+            color: #ffffff;
+            line-height: 1.4;
+            padding: 15px;
+            font-size: 14px;
+        }
+
+        .terminal-container {
+            width: 100%;
+            max-width: 950px;
+            margin: 0 auto;
+            display: block;
+        }
+
+        /* --- 历史日志流区 --- */
+        #console-log {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            word-break: break-all;
+        }
+
+        /* --- 配色矩阵 --- */
+        .accent-blue { color: #24a0ed; font-weight: bold; }
+        .accent-green { color: #50fa7b; }
+        .accent-red { color: #ff5555; }
+        .accent-yellow { color: #f1fa8c; }
+        .accent-dim { color: #777777; }
+
+        /* --- 动态文档流输入行 --- */
+        .input-line {
+            display: flex;
+            align-items: center;
+            width: 100%;
+            background-color: #000000;
+            margin-top: 5px;
+            padding-bottom: 25px;
+        }
+
+        .prompt-prefix {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+            margin-right: 8px;
+        }
+
+        .prompt-arrow {
+            color: #ffffff;
+            font-weight: bold;
+        }
+
+        /* 终端无边框输入框，保留经典绿色闪烁光标 */
+        input[type="text"] {
+            flex: 1;
+            background-color: #000000;
+            color: #ffffff;
+            border: none;
+            outline: none;
+            font-size: 14px;
+            padding: 0;
+            width: 100%;
+            caret-color: #50fa7b; 
+        }
+
+        /* --- 移动端高兼容性屏幕适配 --- */
+        @media (max-width: 640px) {
+            body {
+                padding: 10px;
+                font-size: 13px;
+            }
+            input[type="text"] {
+                font-size: 13px;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<div class="terminal-container">
+    <div id="console-log">Welcome to GenBank
+Current System Session: Active
+Main Protocols: NCBI HTTPS &amp; iFlytek WSS Multi-routing
+
+Type 'help' to list all environment commands and clear operational diagnostics.
+Any non-system inputs will automatically trigger an NCBI GenBank query.
+Designed by Jaily ownblogs.dpdns.org
+
+GenShin,lauching!
+
+--------------------------------------------------</div>
+
+    <div class="input-line" id="interactive-row">
+        <div class="prompt-prefix" id="prompt-wrapper">
+            <span class="accent-blue" id="prompt-env">~</span>
+            <span class="prompt-arrow">&lt;&lt;&lt;</span>
+        </div>
+        <input type="text" id="term-input" autofocus autocomplete="off" placeholder="Type a keyword to search GenBank or 'spark'...">
+    </div>
+</div>
+
+<script>
+    // --- 系统底层状态机分配 ---
+    let currentState = 'MAIN'; // 核心状态: MAIN (主控), GB_NUMBER (生物序号选择), GB_CONFIRM (确认下载), SPARK (星火对话流)
+    let currentResults = [];      
+    let selectedIndex = -1;       
+    let isStreaming = false;      // 标记大模型是否正在吐字
+    let currentStreamSpan = null; // 动态挂载文本流的节点
+
+    // 已完全绑定的讯飞控制台专属凭证
+    const SPARK_CREDENTIALS = {
+        appId: "ae750993", 
+        apiKey: "AEuuVDDknHwqQzNgFBVO",
+        apiSecret: "wqlTUdJrNyNPwTgQxOEw",
+        endpoint: "wss://spark-api.xf-yun.com/v1.1/chat"
+    };
+
+    const consoleLog = document.getElementById('console-log');
+    const termInput = document.getElementById('term-input');
+    const interactiveRow = document.getElementById('interactive-row');
+    const promptEnv = document.getElementById('prompt-env');
+
+    // 全局点击重聚焦，维持纯终端操作感
+    document.addEventListener('click', () => termInput.focus());
+
+    // 核心回车流事件监听
+    termInput.addEventListener('keydown', async function(e) {
+        if (e.key === 'Enter') {
+            const rawValue = termInput.value.trim();
+            termInput.value = ''; 
+            
+            if (!rawValue && currentState !== 'GB_CONFIRM') return;
+
+            // 暂时隐藏输入行，防止异步数据流错位
+            interactiveRow.style.display = 'none';
+
+            try {
+                // 路由状态机逻辑分支
+                switch (currentState) {
+                    case 'MAIN':
+                        await handleMainState(rawValue);
+                        interactiveRow.style.display = 'flex'; // 执行完立刻恢复输入框
+                        break;
+                    case 'GB_NUMBER':
+                        handleGBNumberState(rawValue);
+                        interactiveRow.style.display = 'flex';
+                        break;
+                    case 'GB_CONFIRM':
+                        await handleGBConfirmState(rawValue);
+                        interactiveRow.style.display = 'flex';
+                        break;
+                    case 'SPARK':
+                        await handleSparkWebSocketState(rawValue); 
+                        // 星火流控为异步 WebSocket，恢复逻辑交由单帧结束标记控制
+                        break;
+                }
+            } catch (err) {
+                appendLog(`[internal error] Environment cracked: ${err.message}`, 'accent-red');
+                interactiveRow.style.display = 'flex';
+            }
+            
+            // 追踪视图底部
+            window.scrollTo({
+                top: document.body.scrollHeight,
+                behavior: 'smooth'
+            });
+            
+            termInput.focus();
+        }
+    });
+
+    // 状态组 1: 主控控制台命令分配
+    async function handleMainState(cmd) {
+        const currentEnvText = promptEnv.textContent;
+        appendLog(`${currentEnvText} <<< ${cmd}`);
+
+        // 1. 系统内置指令：help
+        if (cmd.toLowerCase() === 'help') {
+            appendLog(`\n---- AVAILABLE COMMANDS ----`);
+            appendLog(`help                          Show this operational manual.`);
+            appendLog(`spark                         Initialize and access iFlytek Spark Lite WSS shell.`);
+            appendLog(`clear                         Reset terminal buffer display.`);
+            appendLog(`any other text                Defaults to NCBI GenBank biological search.`);
+            appendLog(`-----------------------------\n`);
+            return;
+        }
+
+        // 2. 系统内置指令：clear
+        if (cmd.toLowerCase() === 'clear') {
+            consoleLog.textContent = 'Terminal buffer cleared.\n';
+            return;
+        }
+
+        // 3. 系统内置指令：进入星火
+        if (cmd.toLowerCase() === 'spark') {
+            currentState = 'SPARK';
+            promptEnv.textContent = 'spark@lite:~$';
+            promptEnv.className = 'accent-green';
+            termInput.placeholder = "Ask Spark Lite anything (CORS free) or 'exit'...";
+            appendLog(`\n[system] Initiating WebSocket Handshake Authentication Protocol...`);
+            appendLog(`[system] Credentials loaded via secure platform panel.`);
+            appendLog(`[system] Welcome to Spark Lite Stream Shell. (Type 'exit' to quit)\n`);
+            return;
+        }
+
+        // 4. 兼容旧语法的显式指令（可选保留）
+        if (cmd.startsWith('pkg search --query ')) {
+            const term = cmd.replace('pkg search --query ', '').trim();
+            if(!term) { appendLog(`[error] missing query argument.`, 'accent-red'); return; }
+            await executeGenBankSearch(term);
+            return;
+        }
+        if (cmd.startsWith('pkg fetch --id ')) {
+            const id = cmd.replace('pkg fetch --id ', '').trim();
+            if(!id) { appendLog(`[error] missing identifier argument.`, 'accent-red'); return; }
+            setupDirectFetch(id);
+            return;
+        }
+
+        // 5. 【核心调整】默认缺省逻辑：直接输入任何其他内容，全部作为生物检索关键词投递
+        await executeGenBankSearch(cmd);
+    }
+
+    // 状态组 2: 讯飞星火原生 WebSocket 算法握手与流式渲染
+    function getSparkWSUrl() {
+        const url = SPARK_CREDENTIALS.endpoint;
+        const host = "spark-api.xf-yun.com";
+        const date = new Date().toUTCString(); 
+        
+        const signatureOrigin = `host: ${host}\ndate: ${date}\nGET /v1.1/chat HTTP/1.1`;
+        const signatureSha = CryptoJS.HmacSHA256(signatureOrigin, SPARK_CREDENTIALS.apiSecret);
+        const signature = CryptoJS.enc.Base64.stringify(signatureSha);
+        
+        const authorizationOrigin = `api_key="${SPARK_CREDENTIALS.apiKey}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
+        const authorization = CryptoJS.enc.Base64.stringify(CryptoJS.enc.Utf8.parse(authorizationOrigin));
+        
+        return `${url}?authorization=${authorization}&date=${encodeURIComponent(date)}&host=${host}`;
+    }
+
+    async function handleSparkWebSocketState(message) {
+        appendLog(`spark@lite:~$ <<< ${message}`);
+
+        if (message.toLowerCase() === 'exit') {
+            currentState = 'MAIN';
+            promptEnv.textContent = '~';
+            promptEnv.className = 'accent-blue';
+            termInput.placeholder = "Type a keyword to search GenBank or 'spark'...";
+            appendLog(`[system] Closed connection channel to Spark server.\n`);
+            interactiveRow.style.display = 'flex';
+            return;
+        }
+
+        appendLog(`[process] opening wss shakehand tunnel...`, 'accent-dim');
+        isStreaming = true;
+
+        try {
+            const wsUrl = getSparkWSUrl();
+            const ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                appendLog(`[process] protocol upgrade success. streaming buffer pipeline...`, 'accent-dim');
+                appendLog(`\n[Spark Lite Response]`);
+                
+                // 动态向 DOM 中挂载单点容器：不分配任何颜色类，使其继承默认终端白（#ffffff）与一致字体
+                currentStreamSpan = document.createElement('span');
+                consoleLog.appendChild(currentStreamSpan);
+
+                // 发送标准化星火 WSS 帧负载结构
+                const requestPayload = {
+                    "header": { "app_id": SPARK_CREDENTIALS.appId },
+                    "parameter": { "chat": { "domain": "general", "temperature": 0.6, "max_tokens": 2048 } },
+                    "payload": { "message": { "text": [{ "role": "user", "content": message }] } }
+                };
+                ws.send(JSON.stringify(requestPayload));
+            };
+
+            ws.onmessage = (event) => {
+                const responseData = JSON.parse(event.data);
+                
+                if (responseData.header.code !== 0) {
+                    currentStreamSpan.textContent += `\n[error] Response Failure Code ${responseData.header.code}: ${responseData.header.message}`;
+                    ws.close();
+                    finalizeSparkStream();
+                    return;
+                }
+
+                // 捕获增量文本片段，实现动态纯白“吐字”效果
+                const textChunks = responseData.payload.choices.text;
+                if (textChunks && textChunks.length > 0) {
+                    currentStreamSpan.textContent += textChunks[0].content;
+                    window.scrollTo(0, document.body.scrollHeight);
+                }
+
+                if (responseData.header.status === 2) {
+                    ws.close();
+                    finalizeSparkStream();
+                }
+            };
+
+            ws.onerror = (error) => {
+                appendLog(`\n[fatal] WebSocket transport pipe error. Connection refused.`, 'accent-red');
+                finalizeSparkStream();
+            };
+
+            ws.onclose = () => {
+                finalizeSparkStream();
+            };
+
+        } catch (err) {
+            appendLog(`[fatal] Secure handshake assembly failed: ${err.message}`, 'accent-red');
+            finalizeSparkStream();
+        }
+    }
+
+    function finalizeSparkStream() {
+        if (!isStreaming) return;
+        isStreaming = false;
+        appendLog(`\n`); 
+        interactiveRow.style.display = 'flex';
+        window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        termInput.focus();
+    }
+
+    // 状态组 3: NCBI 生物检索流控制体系
+    async function executeGenBankSearch(keyword) {
+        try {
+            let queryTerm = keyword;
+            if (/[\u4e00-\u9fa5]/.test(keyword)) {
+                appendLog(`[process] biological character conversion needed...`);
+                const transUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(keyword)}&langpair=zh|en`;
+                const transRes = await fetch(transUrl);
+                const transData = await transRes.json();
+                queryTerm = transData.responseData.translatedText;
+                appendLog(`[process] internal translated term: "${queryTerm}"`);
+            }
+
+            appendLog(`[process] handshaking with NCBI servers...`);
+            const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=nucleotide&term=${encodeURIComponent(queryTerm)}&retmode=json&retmax=8`;
+            const searchRes = await fetch(searchUrl);
+            const searchData = await searchRes.json();
+            
+            const idList = searchData.esearchresult.idlist;
+            if (!idList || idList.length === 0) {
+                appendLog(`[error] zero response elements mapped for "${keyword}".`, 'accent-red');
+                return;
+            }
+
+            const summaryUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=nucleotide&id=${idList.join(',')}&retmode=json`;
+            const summaryRes = await fetch(summaryUrl);
+            const summaryData = await summaryRes.json();
+
+            currentResults = [];
+            let displayIndex = 1;
+
+            appendLog(`\n---- SEARCH RESULTS ----`);
+            idList.forEach(id => {
+                const item = summaryData.result[id];
+                if (item) {
+                    const acc = item.accessionversion || item.caption;
+                    currentResults.push({ accession: acc, title: item.title, length: item.slen });
+                    appendLog(`[${displayIndex}] Accession: ${acc}\n    Definition: ${item.title}\n    Length: ${item.slen} bp\n`);
+                    displayIndex++;
+                }
+            });
+            appendLog("------------------------");
+
+            currentState = 'GB_NUMBER';
+            termInput.placeholder = `enter selection index number (1-${currentResults.length})...`;
+        } catch (error) {
+            appendLog(`[fatal] GenBank core pipeline exception: ${error.message}`, 'accent-red');
+        }
+    }
+
+    function handleGBNumberState(input) {
+        appendLog(`~ <<< ${input}`);
+        const parsedInt = parseInt(input, 10);
+        if (isNaN(parsedInt) || parsedInt < 1 || parsedInt > currentResults.length) {
+            appendLog(`[error] boundary violation. range [1-${currentResults.length}].`, 'accent-red');
+            return;
+        }
+        selectedIndex = parsedInt - 1;
+        currentState = 'GB_CONFIRM';
+        termInput.placeholder = `confirm (y/n)...`;
+        appendLog(`\n>>> Confirm downstream execution block for target [${currentResults[selectedIndex].accession}]? (Y/N):`, 'accent-yellow');
+    }
+
+    function setupDirectFetch(id) {
+        currentResults = [{ accession: id, length: 'unknown' }];
+        selectedIndex = 0;
+        currentState = 'GB_CONFIRM';
+        termInput.placeholder = `confirm (y/n)...`;
+        appendLog(`\n>>> Confirm downstream execution block for target [${id}]? (Y/N):`, 'accent-yellow');
+    }
+
+    async function handleGBConfirmState(input) {
+        const cleanInput = input.trim().toLowerCase();
+        appendLog(`~ <<< ${input}`);
+
+        if (cleanInput === 'y' || cleanInput === 'yes') {
+            const targetAccession = currentResults[selectedIndex].accession;
+            appendLog(`[process] calling downstream fasta data buffer pipeline...`);
+            const ncbiUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nucleotide&id=${targetAccession}&rettype=fasta&retmode=text`;
+            try {
+                const response = await fetch(ncbiUrl);
+                const data = await response.text();
+                appendLog(`\n---- STDOUT BUFFER ----`);
+                appendLog(data.trim() || "null block", 'accent-blue');
+                appendLog(`-----------------------\n`);
+            } catch (error) {
+                appendLog(`[fatal] transport tier collapse: ${error.message}`, 'accent-red');
+            } finally { resetToMainState(); }
+        } else {
+            appendLog(`[info] transaction dumped.\n`);
+            resetToMainState();
+        }
+    }
+
+    function resetToMainState() {
+        currentState = 'MAIN';
+        currentResults = [];
+        selectedIndex = -1;
+        termInput.placeholder = "Type a keyword to search GenBank or 'spark'...";
+    }
+
+    function appendLog(text, className = '') {
+        const span = document.createElement('span');
+        if (className) span.className = className;
+        span.textContent = text + '\n';
+        consoleLog.appendChild(span);
+    }
+</script>
+</body>
+</html>
